@@ -1,0 +1,15 @@
+{
+  "name": "engfluent-korean-english-tutor",
+  "version": "1.0.0",
+  "description": "An intermediate to advanced English learning application tailored for Korean speakers, featuring scenario-based practice, AI feedback, and adjustable response timing.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "date-fns": "^3.6.0"
+  }
+}

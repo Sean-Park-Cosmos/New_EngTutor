@@ -1,0 +1,7 @@
+{
+  "name": "EngFluent - Korean English Tutor",
+  "description": "An intermediate to advanced English learning application tailored for Korean speakers, featuring scenario-based practice, AI feedback, and adjustable response timing.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
