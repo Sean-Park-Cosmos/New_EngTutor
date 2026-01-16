@@ -1,5 +1,6 @@
-import { format } from 'date-fns'; // Import format from date-fns for timestamps
-import { SavedSession } from './types'; // Import SavedSession type
+
+import { format } from 'date-fns';
+import { SavedSession, HistoryEntry } from './types';
 
 export function decode(base64: string) {
   const binaryString = atob(base64);
@@ -31,35 +32,42 @@ export async function decodeAudioData(
 }
 
 // Generic Download Function
-export function downloadTextFile(filename: string, content: string) {
+export function downloadFile(filename: string, content: string, contentType: string = 'text/plain') {
   const element = document.createElement('a');
-  const file = new Blob([content], {type: 'text/plain'});
+  const file = new Blob([content], { type: contentType });
   element.href = URL.createObjectURL(file);
   element.download = filename;
-  document.body.appendChild(element); // Required for this to work in FireFox
+  document.body.appendChild(element);
   element.click();
   document.body.removeChild(element);
 }
 
-// Local Storage Explanation Functions
-export const LOCAL_STORAGE_EXPLANATION_KEY = 'engfluent_ai_explanations.txt';
+// History JSON Functions
+export const LOCAL_STORAGE_HISTORY_KEY = 'engfluent_history.json';
 
-export function appendExplanationToLocalStorage(explanation: string): void {
-  const existingContent = localStorage.getItem(LOCAL_STORAGE_EXPLANATION_KEY) || '';
-  const timestamp = format(new Date(), 'yyyy-MM-dd HH:mm:ss');
-  const newEntry = `--- Explanation from ${timestamp} ---\n${explanation}\n\n`;
-  localStorage.setItem(LOCAL_STORAGE_EXPLANATION_KEY, existingContent + newEntry);
+export function saveToHistory(entry: HistoryEntry): void {
+  const existingHistoryString = localStorage.getItem(LOCAL_STORAGE_HISTORY_KEY);
+  let history: HistoryEntry[] = [];
+  try {
+    history = existingHistoryString ? JSON.parse(existingHistoryString) : [];
+  } catch (e) {
+    console.error("Error parsing history from localStorage", e);
+    history = [];
+  }
+  history.unshift(entry); // Newest first
+  localStorage.setItem(LOCAL_STORAGE_HISTORY_KEY, JSON.stringify(history, null, 2));
 }
 
-export function getExplanationsFromLocalStorage(): string {
-  return localStorage.getItem(LOCAL_STORAGE_EXPLANATION_KEY) || 'No explanations saved yet.';
+export function getHistoryFromLocalStorage(): string {
+  const data = localStorage.getItem(LOCAL_STORAGE_HISTORY_KEY);
+  return data || '[]';
 }
 
-export function clearExplanationsFromLocalStorage(): void {
-  localStorage.removeItem(LOCAL_STORAGE_EXPLANATION_KEY);
+export function clearHistoryFromLocalStorage(): void {
+  localStorage.removeItem(LOCAL_STORAGE_HISTORY_KEY);
 }
 
-// Local Storage Saved Sessions Functions
+// Saved Sessions Functions (UI Navigation focus)
 export const LOCAL_STORAGE_SESSIONS_KEY = 'engfluent_saved_sessions';
 
 export function saveSessionToLocalStorage(session: SavedSession): void {
@@ -69,9 +77,9 @@ export function saveSessionToLocalStorage(session: SavedSession): void {
     sessions = existingSessionsString ? JSON.parse(existingSessionsString) : [];
   } catch (e) {
     console.error("Error parsing saved sessions from localStorage", e);
-    sessions = []; // Reset if corrupted
+    sessions = [];
   }
-  sessions.unshift(session); // Add new session to the beginning
+  sessions.unshift(session);
   localStorage.setItem(LOCAL_STORAGE_SESSIONS_KEY, JSON.stringify(sessions));
 }
 
@@ -81,7 +89,7 @@ export function getSavedSessionsFromLocalStorage(): SavedSession[] {
     return sessionsString ? JSON.parse(sessionsString) : [];
   } catch (e) {
     console.error("Error parsing saved sessions from localStorage", e);
-    return []; // Return empty array if corrupted
+    return [];
   }
 }
 

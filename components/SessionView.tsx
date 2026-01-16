@@ -1,29 +1,33 @@
+
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { EnglishLevel, Scenario, QuestionResponse, FeedbackResponse, SavedSession } from '../types';
 import { generateQuestion, analyzeAudioResponse, generateSpeech } from '../services/geminiService';
-import { decode, decodeAudioData, saveSessionToLocalStorage, getSavedSessionsFromLocalStorage } from '../utils'; // Import saveSessionToLocalStorage
-import { Mic, Square, Volume2, Clock, AlertCircle, ChevronLeft, Repeat, Info, Save, Ear } from 'lucide-react'; // Import Save and Ear icons
+import { decode, decodeAudioData, saveSessionToLocalStorage, getSavedSessionsFromLocalStorage } from '../utils';
+import { Mic, Square, Volume2, VolumeX, Clock, AlertCircle, ChevronLeft, Repeat, RefreshCw, X, ShieldAlert, AudioLines } from 'lucide-react';
 import { Spinner } from './Spinner';
 import FeedbackDisplay from './FeedbackDisplay';
-import { format } from 'date-fns'; // Import format for timestamp
+import { format } from 'date-fns';
 
 interface SessionViewProps {
   level: EnglishLevel;
   scenario: Scenario;
   onBack: () => void;
-  reviewSessionId?: string; // New prop for review mode
+  reviewSessionId?: string;
 }
 
 const SessionView: React.FC<SessionViewProps> = ({ level, scenario, onBack, reviewSessionId }) => {
   const [status, setStatus] = useState<'initializing' | 'ready' | 'recording' | 'processing' | 'feedback'>('initializing');
   const [questionData, setQuestionData] = useState<QuestionResponse | null>(null);
-  const [audioBase64, setAudioBase64] = useState<string | null>(null); // For question audio
-  const [userAudioBase64ForSession, setUserAudioBase64ForSession] = useState<string | null>(null); // For user's recorded audio
+  const [audioBase64, setAudioBase64] = useState<string | null>(null);
+  const [isAudioLoading, setIsAudioLoading] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<FeedbackResponse | null>(null);
-  const [autoSubmitTime, setAutoSubmitTime] = useState<number>(3); // Seconds
-  const [timeLeft, setTimeLeft] = useState<number>(0);
-  const [apiError, setApiError] = useState<string | null>(null); // New state for API errors
-  const [isAudioPromptEnabled, setIsAudioPromptEnabled] = useState<boolean>(false); // New state for audio prompt toggle, default disabled
+  const [autoSubmitTime, setAutoSubmitTime] = useState<number>(3);
+  const [apiError, setApiError] = useState<string | null>(null);
+  const [isCooldown, setIsCooldown] = useState<boolean>(false);
+  const [cooldownTime, setCooldownTime] = useState<number>(0);
+  const [maxCooldown, setMaxCooldown] = useState<number>(60);
+  
+  const [isAudioPromptEnabled, setIsAudioPromptEnabled] = useState<boolean>(false);
   
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
@@ -31,56 +35,148 @@ const SessionView: React.FC<SessionViewProps> = ({ level, scenario, onBack, revi
   const analyserRef = useRef<AnalyserNode | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const cooldownIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isSpeechGeneratingRef = useRef<boolean>(false);
   
-  // Audio playback context
-  const [audioContext] = useState(() => new (window.AudioContext || (window as any).webkitAudioContext)({sampleRate: 24000}));
-  const [currentAudioSource, setCurrentAudioSource] = useState<AudioBufferSourceNode | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const currentAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const lastQuestionRef = useRef<string | null>(null);
 
   const isReviewMode = !!reviewSessionId;
 
-  // -- Audio Playback Helper --
-  const playAudio = async (base64: string) => {
-    if (!base64) return;
-    
-    // Stop previous
-    if (currentAudioSource) {
-        try { currentAudioSource.stop(); } catch(e) {}
+  const getAudioContext = useCallback(() => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({sampleRate: 24000});
     }
+    return audioContextRef.current;
+  }, []);
+
+  const playAudio = useCallback(async (base64: string) => {
+    if (!base64) return;
+    if (currentAudioSourceRef.current) {
+        try { currentAudioSourceRef.current.stop(); } catch(e) {}
+    }
+    try {
+        const ctx = getAudioContext();
+        if (ctx.state === 'suspended') await ctx.resume();
+        const buffer = await decodeAudioData(decode(base64), ctx, 24000, 1);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        source.start();
+        currentAudioSourceRef.current = source;
+    } catch (e) { console.error("Error playing audio", e); }
+  }, [getAudioContext]);
+
+  const handleQuotaError = useCallback((error: any) => {
+    const errorString = typeof error.message === 'string' ? error.message : JSON.stringify(error);
+    const isQuota = 
+      error.status === 429 || 
+      error.code === 429 || 
+      error.status === "RESOURCE_EXHAUSTED" ||
+      errorString.includes("Quota exceeded") || 
+      errorString.includes("RESOURCE_EXHAUSTED");
+
+    if (isQuota) {
+      let delay = 60; 
+      const match = errorString.match(/retry in (\d+\.?\d*)s/i);
+      if (match) delay = Math.ceil(parseFloat(match[1]));
+      
+      setIsCooldown(true);
+      setCooldownTime(delay);
+      setMaxCooldown(delay);
+      setApiError(`The AI tutor is resting. Cooling down for ${delay} seconds.`);
+      
+      if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+      cooldownIntervalRef.current = setInterval(() => {
+        setCooldownTime(prev => {
+          if (prev <= 1) {
+            if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+            setIsCooldown(false);
+            setApiError(null);
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    } else {
+      setApiError(`Connection error: ${error.message || 'Unknown'}`);
+    }
+  }, []);
+
+  const loadQuestion = useCallback(async () => {
+    if (isReviewMode) return;
+    if (isSpeechGeneratingRef.current) return;
+    
+    setStatus('initializing');
+    setFeedback(null);
+    setAudioBase64(null);
+    setApiError(null);
+    setIsAudioLoading(false);
 
     try {
-        if (audioContext.state === 'suspended') {
-            await audioContext.resume();
+      if (scenario.id === 'self-study') {
+        const data = { question: scenario.systemPromptContext, contextKr: scenario.titleKr };
+        setQuestionData(data);
+        lastQuestionRef.current = data.question;
+        setStatus('ready');
+      } else {
+        const data = await generateQuestion(scenario.id, level, lastQuestionRef.current || undefined);
+        setQuestionData(data);
+        lastQuestionRef.current = data.question;
+        setStatus('ready');
+
+        if (!isCooldown) {
+          isSpeechGeneratingRef.current = true;
+          setIsAudioLoading(true);
+          try {
+            const speechData = await generateSpeech(data.question);
+            setAudioBase64(speechData);
+            if (isAudioPromptEnabled) {
+              playAudio(speechData);
+            }
+          } catch (ttsError: any) {
+            handleQuotaError(ttsError);
+          } finally {
+            isSpeechGeneratingRef.current = false;
+            setIsAudioLoading(false);
+          }
         }
+      }
+    } catch (e: any) {
+      setApiError("Failed to prepare tutor situation.");
+      setStatus('ready');
+    }
+  }, [scenario, level, playAudio, isAudioPromptEnabled, isCooldown, handleQuotaError, isReviewMode]);
 
-        const bytes = decode(base64);
-        // Gemini TTS returns raw PCM at 24kHz mono
-        const buffer = await decodeAudioData(bytes, audioContext, 24000, 1);
-        
-        const source = audioContext.createBufferSource();
-        source.buffer = buffer;
-        source.connect(audioContext.destination);
-        source.start();
-        setCurrentAudioSource(source);
-    } catch (e) {
-        console.error("Error playing audio", e);
+  useEffect(() => {
+    if (isReviewMode && reviewSessionId) {
+      const sessions = getSavedSessionsFromLocalStorage();
+      const session = sessions.find(s => s.id === reviewSessionId);
+      if (session) {
+        setQuestionData(session.questionData);
+        setFeedback(session.feedback);
+        lastQuestionRef.current = session.questionData.question;
+        setStatus('feedback');
+      } else {
+        setApiError("History session not found.");
+        setStatus('ready');
+      }
+    } else if (!isReviewMode) {
+      loadQuestion();
     }
-  };
-
-  // -- Audio Visualizer --
-  const stopVisualizer = useCallback(() => {
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-    if (analyserRef.current && (analyserRef.current.context as any).close) { // Try to close context if it's owned by visualizer
-        try { (analyserRef.current.context as any).close(); } catch(e) { console.warn("Failed to close visualizer audio context", e); }
-    }
-    analyserRef.current = null;
-  }, []);
+    
+    return () => {
+      if (currentAudioSourceRef.current) currentAudioSourceRef.current.stop();
+      if (cooldownIntervalRef.current) clearInterval(cooldownIntervalRef.current);
+      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+      if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    };
+  }, [reviewSessionId, isReviewMode, scenario.id, level]);
 
   const startVisualizer = useCallback((stream: MediaStream) => {
     const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    const inputContext = new AudioContextClass(); // Dedicated context for input stream
+    const inputContext = new AudioContextClass();
     const source = inputContext.createMediaStreamSource(stream);
     const analyser = inputContext.createAnalyser();
     analyser.fftSize = 256;
@@ -92,490 +188,221 @@ const SessionView: React.FC<SessionViewProps> = ({ level, scenario, onBack, revi
 
     const draw = () => {
       if (!canvasRef.current || !analyserRef.current) return;
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
       animationFrameRef.current = requestAnimationFrame(draw);
       analyserRef.current.getByteFrequencyData(dataArray);
-
-      ctx.fillStyle = '#F8FAFC'; // Match background
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-      const barWidth = (canvas.width / bufferLength) * 2.5;
+      const ctx = canvasRef.current.getContext('2d');
+      if (!ctx) return;
+      ctx.fillStyle = '#F8FAFC';
+      ctx.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+      const barWidth = (canvasRef.current.width / bufferLength) * 2.5;
       let barHeight;
       let x = 0;
-
       for (let i = 0; i < bufferLength; i++) {
         barHeight = dataArray[i] / 2;
-        
-        ctx.fillStyle = `rgb(${59}, ${130}, ${246})`; // Primary Blue
-        ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+        ctx.fillStyle = `#3B82F6`;
+        ctx.fillRect(x, canvasRef.current.height - barHeight, barWidth, barHeight);
         x += barWidth + 1;
       }
     };
     draw();
   }, []);
 
-  // -- Question Generation / Session Loading --
-  const loadQuestion = useCallback(async () => {
-    setStatus('initializing');
-    setFeedback(null);
-    setAudioBase64(null);
-    setUserAudioBase64ForSession(null); // Clear user audio for new question
-    setApiError(null); // Clear any previous API errors
-
-    try {
-      if (scenario.id === 'self-study') {
-        setQuestionData({
-            question: scenario.systemPromptContext,
-            contextKr: scenario.titleKr
-        });
-        setAudioBase64(null); // No audio for self-study prompt
-        setStatus('ready');
-      } else {
-        const data = await generateQuestion(scenario.id, level);
-        setQuestionData(data);
-
-        try {
-          const speechData = await generateSpeech(data.question);
-          setAudioBase64(speechData);
-          setStatus('ready');
-          if (isAudioPromptEnabled) { // Conditionally play audio
-            playAudio(speechData);
-          }
-        } catch (ttsError: any) {
-          console.error("TTS Error", ttsError);
-          if (ttsError.message.includes("Quota Exceeded")) {
-            setApiError(ttsError.message);
-          } else {
-            setApiError("Failed to generate audio for the question. Please try again.");
-          }
-          setStatus('ready'); // Still ready to record even if TTS fails
-        }
-      }
-    } catch (e: any) {
-      console.error("Error loading question:", e);
-      if (e.message.includes("Quota Exceeded")) {
-        setApiError(e.message);
-      } else {
-        setApiError("Failed to load question. Please try again.");
-      }
-      setStatus('ready');
-    }
-  }, [scenario, level, playAudio, isAudioPromptEnabled, startVisualizer, stopVisualizer]);
-
-  // Load saved session if in review mode
-  const loadReviewSession = useCallback(() => {
-    setStatus('initializing');
-    setFeedback(null);
-    setApiError(null);
-    
-    const sessions = getSavedSessionsFromLocalStorage();
-    const sessionToReview = sessions.find(s => s.id === reviewSessionId);
-
-    if (sessionToReview) {
-      setQuestionData(sessionToReview.questionData);
-      setAudioBase64(null); // No question audio playback for review, only user's
-      setUserAudioBase64ForSession(sessionToReview.userAudioBase64);
-      setFeedback(sessionToReview.feedback);
-      setStatus('feedback');
-    } else {
-      setApiError("Could not find the saved session.");
-      setStatus('ready'); // Fallback to ready if session not found
-    }
-  }, [reviewSessionId]);
-
-  useEffect(() => {
-    if (isReviewMode) {
-      loadReviewSession();
-    } else {
-      loadQuestion();
-    }
-    return () => {
-      if (currentAudioSource) currentAudioSource.stop();
-      stopVisualizer(); // Ensure visualizer is stopped on unmount
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scenario, isAudioPromptEnabled, isReviewMode]); // Re-run effect when scenario or audio prompt setting changes
-
-  // -- Recording Logic --
-  const _forceStopRecording = useCallback(() => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-      mediaRecorderRef.current = null;
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = null;
-      }
-      stopVisualizer();
-      audioChunksRef.current = [];
-    }
-  }, [stopVisualizer]);
-
-  const startRecording = async () => {
-    setApiError(null); // Clear API errors before recording
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      startVisualizer(stream);
-      
-      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' }); // Explicitly request webm
-      mediaRecorderRef.current = recorder;
-      audioChunksRef.current = [];
-
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-        }
-      };
-
-      recorder.onstop = async () => {
-        stopVisualizer();
-        stream.getTracks().forEach(track => track.stop());
-        
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' }); // Use webm
-        await processAudio(audioBlob);
-      };
-
-      recorder.start();
-      setStatus('recording');
-      resetSilenceTimer();
-    } catch (err) {
-      console.error("Microphone access denied", err);
-      setApiError("Microphone access is required to record your speech.");
-      setStatus('ready');
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-      mediaRecorderRef.current.stop();
-      if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    }
-  };
-
-  const resetSilenceTimer = () => {
-    if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-    setTimeLeft(autoSubmitTime);
-    monitorVolume();
-  };
-
-  const monitorVolume = () => {
+  const monitorVolume = useCallback(() => {
     let silenceStart = Date.now();
-    
     const checkVolume = () => {
         if (mediaRecorderRef.current?.state !== 'recording' || !analyserRef.current) return;
-
-        const analyser = analyserRef.current;
-        const dataArray = new Uint8Array(analyser.fftSize);
-        analyser.getByteTimeDomainData(dataArray);
-        
+        const dataArray = new Uint8Array(analyserRef.current.fftSize);
+        analyserRef.current.getByteTimeDomainData(dataArray);
         let sum = 0;
         for(let i = 0; i < dataArray.length; i++) {
             const v = (dataArray[i] - 128) / 128;
             sum += v * v;
         }
         const rms = Math.sqrt(sum / dataArray.length);
-        const threshold = 0.02; // Sensitivity
-
-        if (rms > threshold) {
-            silenceStart = Date.now(); // Reset silence
-            setTimeLeft(autoSubmitTime);
+        if (rms > 0.02) {
+            silenceStart = Date.now();
         } else {
             const silentSeconds = (Date.now() - silenceStart) / 1000;
-            const remaining = Math.max(0, autoSubmitTime - silentSeconds);
-            setTimeLeft(remaining);
-            
-            if (remaining <= 0) {
-                stopRecording();
-                return;
+            if (silentSeconds >= autoSubmitTime) {
+              mediaRecorderRef.current.stop();
+              return;
             }
         }
         silenceTimerRef.current = setTimeout(checkVolume, 100);
     };
-    silenceTimerRef.current = setTimeout(checkVolume, 100); // Initial call
-  };
+    silenceTimerRef.current = setTimeout(checkVolume, 100);
+  }, [autoSubmitTime]);
 
-  // -- API Processing --
-  const processAudio = async (blob: Blob) => {
-    setStatus('processing');
-    setApiError(null); // Clear any previous API errors
+  const startRecording = async () => {
+    if (isCooldown || status === 'processing' || status === 'recording') return;
+    setApiError(null);
     try {
-      const reader = new FileReader();
-      reader.readAsDataURL(blob);
-      reader.onloadend = async () => {
-        const base64data = (reader.result as string).split(',')[1];
-        setUserAudioBase64ForSession(base64data); // Store user's audio Base64
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      startVisualizer(stream);
+      const recorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      mediaRecorderRef.current = recorder;
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (event) => event.data.size > 0 && audioChunksRef.current.push(event.data);
+      recorder.onstop = async () => {
+        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+        stream.getTracks().forEach(track => track.stop());
+        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        
+        setStatus('processing');
+        const reader = new FileReader();
+        reader.readAsDataURL(blob);
+        reader.onloadend = async () => {
+          const base64data = (reader.result as string).split(',')[1];
+          if (questionData) {
+            try {
+              const result = await analyzeAudioResponse(base64data, questionData.question, level);
+              
+              // VALIDATION: Check if speech was detected
+              if (!result.transcript || result.transcript.trim() === "") {
+                setApiError("I couldn't hear you clearly. Please speak again!");
+                setStatus('ready');
+                return;
+              }
 
-        if (questionData) {
-          try {
-            const result = await analyzeAudioResponse(base64data, questionData.question, level);
-            setFeedback(result);
-            setStatus('feedback');
-
-            // Save the session if not in review mode
-            if (!isReviewMode) {
-              const newSession: SavedSession = {
-                id: Date.now().toString(), // Unique ID for the session
-                timestamp: format(new Date(), 'yyyy-MM-dd HH:mm:ss'),
-                scenario: scenario,
-                level: level,
-                questionData: questionData,
-                userAudioBase64: base64data,
-                feedback: result,
-              };
-              saveSessionToLocalStorage(newSession);
-            }
-
-          } catch (apiAnalysisError: any) {
-            console.error("API Analysis Error", apiAnalysisError);
-            if (apiAnalysisError.message.includes("Quota Exceeded")) {
-              setApiError(apiAnalysisError.message);
-            } else {
-              setApiError("Failed to analyze your speech. Please try again.");
-            }
-            setStatus('ready'); // Go back to ready to record if analysis fails
+              setFeedback(result);
+              setStatus('feedback');
+              if (!isReviewMode) {
+                saveSessionToLocalStorage({
+                  id: Date.now().toString(),
+                  timestamp: format(new Date(), 'yyyy-MM-dd HH:mm:ss'),
+                  scenario, level, questionData, feedback: result,
+                  userAudioBase64: base64data
+                });
+              }
+            } catch (e: any) { handleQuotaError(e); setStatus('ready'); }
           }
-        }
+        };
       };
-    } catch (error: any) {
-      console.error("Processing error", error);
-      setApiError("An unexpected error occurred during audio processing. Please try again.");
+      recorder.start();
+      setStatus('recording');
+      monitorVolume();
+    } catch (err) {
+      setApiError("Microphone access is required.");
       setStatus('ready');
     }
   };
 
-  // -- Render Helpers --
-  const handleSliderChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setAutoSubmitTime(Number(e.target.value));
-  };
-
-  const handleRepractice = useCallback(() => {
-    // Fix: The type error on line 477 is a false positive related to `useCallback`'s dependency array and
-    // TypeScript's inference, as `_forceStopRecording` takes no arguments. The `if` condition correctly
-    // guards the call. No change to this line is needed to fix the runtime behavior or logical correctness.
-    if (status === 'recording') {
-      _forceStopRecording();
-    }
-    setFeedback(null);
-    setStatus('ready');
-    // Only play audio if it's not a self-study session, audio exists, AND audio prompt is enabled
-    if (scenario.id !== 'self-study' && questionData && audioBase64 && isAudioPromptEnabled) {
-      playAudio(audioBase64);
-    }
-  }, [status, scenario.id, questionData, audioBase64, playAudio, _forceStopRecording, isAudioPromptEnabled]);
-
   return (
     <div className="max-w-4xl mx-auto w-full bg-slate-50 p-4 rounded-xl">
-      {/* Back Button */}
-      <button 
-        onClick={onBack}
-        className="mb-4 flex items-center text-slate-500 hover:text-slate-800 transition-colors text-sm font-medium"
-      >
-        <ChevronLeft size={16} /> {isReviewMode ? 'Back to Session List' : 'Back to Scenarios'}
+      <button onClick={onBack} className="mb-4 flex items-center text-slate-500 hover:text-slate-800 transition-colors text-sm font-medium">
+        <ChevronLeft size={16} /> {isReviewMode ? 'Back to History' : 'Back to Scenarios'}
       </button>
 
-      {/* API Error Display */}
       {apiError && (
-        <div className="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative mb-4" role="alert">
-            <strong className="font-bold">Error:</strong>
-            <span className="block sm:inline ml-2">{apiError}</span>
-            <span className="absolute top-0 bottom-0 right-0 px-4 py-3 cursor-pointer" onClick={() => setApiError(null)}>
-                <svg className="fill-current h-6 w-6 text-red-500" role="button" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><title>Close</title><path d="M14.348 14.849a1.2 1.2 0 0 1-1.697 0L10 11.819l-2.651 3.029a1.2 1.2 0 1 1-1.697-1.697l2.758-3.15-2.759-3.152a1.2 1.2 0 1 1 1.697-1.697L10 8.183l2.651-3.031a1.2 1.2 0 1 1 1.697 1.697l-2.758 3.152 2.758 3.15a1.2 1.2 0 0 1 0 1.698z"/></svg>
-            </span>
+        <div className={`border ${isCooldown ? 'bg-indigo-50 border-indigo-200 text-indigo-800' : 'bg-amber-50 border-amber-200 text-amber-800'} px-4 py-4 rounded-xl mb-4 flex items-start gap-4 shadow-sm animate-fade-in`}>
+            {isCooldown ? <ShieldAlert className="text-indigo-500 shrink-0 mt-0.5" size={24} /> : <AlertCircle className="text-amber-500 shrink-0 mt-0.5" size={24} />}
+            <div className="flex-grow">
+              <strong className="block font-bold mb-1 text-base">{isCooldown ? 'Tutor needs a moment' : 'No Input Detected'}</strong>
+              <p className="text-sm leading-relaxed">{apiError}</p>
+              {isCooldown && (
+                <div className="mt-3 flex items-center gap-3">
+                  <div className="h-2 flex-grow bg-indigo-200 rounded-full overflow-hidden">
+                    <div className="h-full bg-indigo-500 transition-all duration-1000 ease-linear" style={{ width: `${(cooldownTime / maxCooldown) * 100}%` }}></div>
+                  </div>
+                  <span className="text-xs font-bold text-indigo-600 w-8">{cooldownTime}s</span>
+                </div>
+              )}
+            </div>
         </div>
       )}
 
-      {/* Question Card */}
       <div className="bg-white rounded-2xl p-8 shadow-lg border border-slate-100 mb-8 text-center relative overflow-hidden min-h-[250px] flex flex-col justify-center">
         {status === 'initializing' ? (
           <div className="flex flex-col items-center py-12">
             <Spinner className="w-10 h-10 text-primary mb-4" />
-            <p className="text-slate-500">
-                {scenario.id === 'self-study' ? 'Preparing Free Practice...' : 'Generating Situation...'}
-            </p>
+            <p className="text-slate-500 font-medium">Preparing practice situation...</p>
           </div>
         ) : (
           <>
             <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-400 to-emerald-400"></div>
-            
             <div className="mb-6">
-              <span className="inline-block px-3 py-1 rounded-full bg-blue-50 text-primary text-xs font-bold uppercase tracking-wider mb-3">
-                {scenario.title}
-              </span>
-              <h2 className="text-2xl md:text-3xl font-bold text-slate-800 mb-3 leading-tight">
-                {questionData?.question}
-              </h2>
-              <p className="text-slate-500 font-kr text-sm md:text-base">
-                {questionData?.contextKr}
-              </p>
+              <span className="inline-block px-3 py-1 rounded-full bg-blue-50 text-primary text-xs font-bold uppercase tracking-wider mb-3">{scenario.title}</span>
+              <h2 className="text-2xl md:text-3xl font-bold text-slate-800 mb-3 leading-tight">{questionData?.question}</h2>
+              <p className="text-slate-500 font-kr text-sm md:text-base">{questionData?.contextKr}</p>
             </div>
+            
+            {!isReviewMode && scenario.id !== 'self-study' && status !== 'feedback' && (
+                <div className="flex flex-col items-center gap-4 mt-4">
+                    <div className="flex items-center gap-6">
+                      <button 
+                        onClick={() => setIsAudioPromptEnabled(!isAudioPromptEnabled)}
+                        className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border transition-all ${isAudioPromptEnabled ? 'bg-primary/10 border-primary text-primary shadow-sm' : 'bg-slate-50 border-slate-200 text-slate-400'}`}
+                      >
+                        {isAudioPromptEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+                        <span className="text-xs font-bold uppercase tracking-tighter">Auto-Voice</span>
+                      </button>
 
-            {!isReviewMode && audioBase64 && scenario.id !== 'self-study' && ( // Hide replay for self-study & review mode
-                <div className="flex justify-center gap-4 mt-4">
-                    <button 
-                      onClick={() => playAudio(audioBase64)}
-                      className="inline-flex items-center gap-2 text-slate-400 hover:text-primary transition-colors text-sm font-medium"
-                      title="Replay the question audio"
-                    >
-                      <Volume2 size={16} /> Replay Audio
-                    </button>
-                    <button
-                      onClick={handleRepractice}
-                      className="inline-flex items-center gap-2 text-slate-400 hover:text-green-600 transition-colors text-sm font-medium"
-                      disabled={status === 'processing'}
-                      title="Re-practice this scenario"
-                    >
-                        <Repeat size={16} /> Re-practice
-                    </button>
+                      {isAudioLoading ? (
+                        <div className="flex items-center gap-2 text-slate-400 animate-pulse text-sm">
+                          <AudioLines size={16} />
+                          <span>Generating...</span>
+                        </div>
+                      ) : (
+                        <button 
+                          onClick={async () => {
+                            if (isSpeechGeneratingRef.current || !questionData) return;
+                            isSpeechGeneratingRef.current = true;
+                            setIsAudioLoading(true);
+                            try {
+                              const speechData = await generateSpeech(questionData.question);
+                              setAudioBase64(speechData);
+                              playAudio(speechData);
+                            } catch (e) { handleQuotaError(e); }
+                            finally { isSpeechGeneratingRef.current = false; setIsAudioLoading(false); }
+                          }}
+                          className="text-slate-500 hover:text-primary transition-colors text-sm font-bold flex items-center gap-2"
+                        >
+                          <Volume2 size={16} /> {audioBase64 ? 'Hear Question' : 'Generate Voice'}
+                        </button>
+                      )}
+                    </div>
                 </div>
-            )}
-            {!isReviewMode && scenario.id === 'self-study' && status === 'ready' && ( // Re-practice for self-study, not in review mode
-                <div className="flex justify-center mt-4">
-                    <button
-                      onClick={handleRepractice}
-                      className="inline-flex items-center gap-2 text-slate-400 hover:text-green-600 transition-colors text-sm font-medium"
-                      title="Re-practice this scenario"
-                    >
-                        <Repeat size={16} /> Re-practice
-                    </button>
-                </div>
-            )}
-
-            {!isReviewMode && ( // Hide Audio Prompt Toggle in review mode
-              <div className="mt-6 pt-4 border-t border-slate-100 max-w-sm mx-auto">
-                <div className="flex items-center justify-between">
-                  <label className="text-xs font-bold text-slate-500 uppercase flex items-center gap-2">
-                      <Volume2 size={14} /> Audio Prompt
-                  </label>
-                  <button
-                    role="switch"
-                    aria-checked={isAudioPromptEnabled}
-                    onClick={() => setIsAudioPromptEnabled(!isAudioPromptEnabled)}
-                    className={`
-                      relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary
-                      ${isAudioPromptEnabled ? 'bg-primary' : 'bg-slate-300'}
-                    `}
-                  >
-                    <span
-                      className={`
-                        inline-block h-4 w-4 transform rounded-full bg-white transition-transform
-                        ${isAudioPromptEnabled ? 'translate-x-6' : 'translate-x-1'}
-                      `}
-                    />
-                  </button>
-                </div>
-                <p className="text-[10px] text-slate-400 mt-2 flex items-start gap-1">
-                    <Info size={12} className="mt-0.5 shrink-0" />
-                    Toggle to automatically play the question audio when a new scenario loads.
-                </p>
-              </div>
             )}
           </>
         )}
       </div>
 
-      {/* Interaction Area (visible only in live session mode, not review mode) */}
-      {(!isReviewMode && (['ready', 'recording', 'processing'] as readonly string[]).includes(status)) && (
-        <div className="flex flex-col items-center mb-8 animate-fade-in">
-          
-          {/* Visualizer Canvas */}
-          <div className="w-full h-24 bg-slate-50 rounded-xl border border-slate-200 mb-6 overflow-hidden relative flex items-center justify-center">
-            {/* Fix: Added conditional rendering for 'processing' status to show a spinner instead of "Ready to record". */}
+      {!isReviewMode && (['ready', 'recording', 'processing'].includes(status)) && (
+        <div className="flex flex-col items-center mb-8">
+          <div className="w-full h-24 bg-slate-50 rounded-xl border border-slate-200 mb-6 overflow-hidden flex items-center justify-center relative">
             {status === 'recording' ? (
-                <canvas ref={canvasRef} width="600" height="100" className="w-full h-full" />
+              <canvas ref={canvasRef} width="600" height="100" className="w-full h-full" />
             ) : status === 'processing' ? (
+              <div className="flex flex-col items-center gap-2">
                 <Spinner className="w-8 h-8 text-primary" />
-            ) : ( // This implies status === 'ready'
-                <div className="text-slate-400 text-sm flex items-center gap-2">
-                    <Mic size={16} /> Ready to record
-                </div>
-            )}
-          </div>
-
-          <div className="flex items-center gap-6 w-full justify-center">
-             {/* Record Button */}
-            {status === 'recording' ? (
-              <button
-                onClick={stopRecording}
-                className="w-20 h-20 rounded-full bg-red-500 hover:bg-red-600 text-white shadow-xl flex items-center justify-center transition-transform transform active:scale-95 animate-pulse"
-                title="Stop Recording"
-              >
-                <Square size={32} fill="currentColor" />
-              </button>
+                <span className="text-xs font-bold text-slate-400 uppercase tracking-widest animate-pulse">Analyzing Response...</span>
+              </div>
             ) : (
-              <button
-                onClick={startRecording}
-                disabled={status !== 'ready' || apiError !== null} 
-                className={`
-                  w-20 h-20 rounded-full text-white shadow-xl flex items-center justify-center transition-all transform hover:-translate-y-1
-                  ${(status !== 'ready' || apiError !== null) ? 'bg-slate-300 cursor-not-allowed' : 'bg-primary hover:bg-blue-600'}
-                `}
-                title="Start Recording"
-              >
-                {status === 'processing' ? <Spinner className="w-8 h-8" /> : <Mic size={32} />}
-              </button>
+              <div className="text-slate-400 text-sm flex items-center gap-2 font-medium">
+                <Mic size={16} className="animate-bounce" /> Click button below to speak
+              </div>
             )}
           </div>
-
-          {/* Status Text */}
-          <div className="mt-6 h-6">
-             {status === 'recording' && (
-                 <p className="text-slate-600 font-medium animate-pulse flex items-center gap-2">
-                    Listening... <span className="text-xs bg-slate-200 px-2 py-0.5 rounded text-slate-600 font-mono">Auto-stop in {Math.ceil(timeLeft)}s of silence</span>
-                 </p>
-             )}
-             {status === 'processing' && (
-                 <p className="text-primary font-medium flex items-center gap-2">
-                    Analyzing your speech...
-                 </p>
-             )}
-          </div>
-
-          {/* Settings Bar */}
-          <div className="mt-8 w-full max-w-md bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-            {/* Silence Auto-Stop Delay */}
+          <button 
+            onClick={status === 'recording' ? () => mediaRecorderRef.current?.stop() : startRecording} 
+            disabled={status === 'processing' || status === 'initializing' || isCooldown} 
+            className={`w-20 h-20 rounded-full text-white shadow-xl flex items-center justify-center transition-all transform active:scale-95 ${status === 'recording' ? 'bg-red-500 animate-pulse' : 'bg-primary hover:bg-blue-600'} disabled:opacity-40`}
+          >
+            {status === 'recording' ? <Square size={32} /> : <Mic size={32} />}
+          </button>
+          
+          <div className="mt-8 w-full max-w-md bg-white p-4 rounded-xl border border-slate-200">
             <div className="flex items-center justify-between mb-2">
-                <label className="text-xs font-bold text-slate-500 uppercase flex items-center gap-2">
-                    <Clock size={14} /> Silence Auto-Stop Delay
-                </label>
-                <span className="text-sm font-bold text-primary">{autoSubmitTime}s</span>
+              <label className="text-xs font-bold text-slate-500 uppercase flex items-center gap-2"><Clock size={14} /> Auto-Stop Silence Delay</label>
+              <span className="text-sm font-bold text-primary">{autoSubmitTime}s</span>
             </div>
-            <input 
-                type="range" 
-                min="1" 
-                max="10" 
-                step="1"
-                value={autoSubmitTime}
-                onChange={handleSliderChange}
-                className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-primary"
-            />
-            <p className="text-[10px] text-slate-400 mt-2 flex items-start gap-1">
-                <AlertCircle size={12} className="mt-0.5 shrink-0" />
-                Adjust how long the app waits after you stop speaking before analyzing.
-            </p>
+            <input type="range" min="1" max="10" step="1" value={autoSubmitTime} onChange={(e) => setAutoSubmitTime(Number(e.target.value))} className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-primary" disabled={isCooldown} />
           </div>
         </div>
       )}
 
-      {/* Feedback Area */}
       {status === 'feedback' && feedback && (
-        <>
-          {/* User's Audio Playback for Review */}
-          {isReviewMode && userAudioBase64ForSession && (
-            <div className="mb-4 bg-slate-100 p-4 rounded-xl flex justify-center items-center gap-3 border border-slate-200">
-                <span className="text-sm font-medium text-slate-700 flex items-center gap-2"><Ear size={16} /> Your Recorded Speech</span>
-                <button
-                    onClick={() => playAudio(userAudioBase64ForSession)}
-                    className="px-4 py-2 rounded-full bg-primary text-white hover:bg-blue-600 transition-colors flex items-center gap-2 text-sm font-medium"
-                    title="Play your recorded audio from this session"
-                >
-                    <Volume2 size={16} /> Play Recording
-                </button>
-            </div>
-          )}
-          <FeedbackDisplay feedback={feedback} onNext={isReviewMode ? onBack : loadQuestion} />
-        </>
+        <FeedbackDisplay feedback={feedback} question={questionData?.question || ''} level={level} onNext={isReviewMode ? onBack : loadQuestion} />
       )}
     </div>
   );

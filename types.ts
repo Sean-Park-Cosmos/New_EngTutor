@@ -1,3 +1,4 @@
+
 export enum EnglishLevel {
   INTERMEDIATE = 'Intermediate',
   ADVANCED = 'Advanced',
@@ -35,9 +36,9 @@ export interface FeedbackResponse {
   grammarScore: number;
   pronunciationScore: number;
   fluencyScore: number;
-  speakingRateWPM?: number; // New: Words Per Minute speaking rate
+  speakingRateWPM?: number;
   pronunciationTips?: PronunciationTip[];
-  transcriptConfidence?: number; // AI's confidence in its own transcription (0-1)
+  transcriptConfidence?: number;
   promptTokens?: number;
   userAnswerTokens?: number;
   responseTokens?: number;
@@ -51,19 +52,36 @@ export interface QuestionResponse {
 export interface PronunciationCheckResponse {
   transcript: string;
   pronunciationScore: number;
-  accuracyMessage: string; // e.g., "Excellent match!", "Needs improvement", "Did not match target text"
-  explanationEn: string; // Specific to pronunciation
-  explanationKr: string; // Specific to pronunciation
+  accuracyMessage: string;
+  explanationEn: string;
+  explanationKr: string;
   pronunciationTips?: PronunciationTip[];
   transcriptConfidence?: number;
 }
 
 export interface SavedSession {
   id: string;
-  timestamp: string; // e.g., "2023-10-27 10:30:00"
+  timestamp: string;
   scenario: Scenario;
   level: EnglishLevel;
   questionData: QuestionResponse;
-  userAudioBase64: string; // Base64 of user's recorded audio
+  userAudioBase64: string;
   feedback: FeedbackResponse;
+}
+
+export interface HistoryEntry {
+  timestamp: string;
+  question: string;
+  level: string;
+  transcript: string;
+  correction: string;
+  explanationEn: string;
+  explanationKr: string;
+  scores: {
+    grammar: number;
+    pronunciation: number;
+    fluency: number;
+    speakingRateWPM?: number;
+  };
+  examples: string[];
 }

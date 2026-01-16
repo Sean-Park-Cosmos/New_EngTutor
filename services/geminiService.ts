@@ -1,30 +1,91 @@
+
 import { GoogleGenAI, Type, Modality } from "@google/genai";
 import { EnglishLevel, FeedbackResponse, QuestionResponse, PronunciationCheckResponse } from '../types';
 import { LOCAL_QUESTIONS } from '../questions';
 
-const apiKey = process.env.API_KEY || '';
-const ai = new GoogleGenAI({ apiKey });
+// Initialize the Gemini API client
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 
-const MODEL_NAME = 'gemini-2.5-flash-lite'; // Changed to gemini-2.5-flash-lite for low-latency
+const MODEL_NAME = 'gemini-3-flash-preview'; 
 const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
 
 /**
- * Retrieves a random situational question from the local database based on scenario and level.
- * Replaces the AI generation to improve performance.
+ * Utility for retrying API calls with exponential backoff.
  */
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 4, baseDelay = 2000): Promise<T> {
+  let lastError: any;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      lastError = error;
+      
+      let retryAfterMs = 0;
+      try {
+        const errorString = typeof error.message === 'string' ? error.message : JSON.stringify(error);
+        const braceIndex = errorString.indexOf('{');
+        // Extract JSON only if it exists in the error string
+        const errorData = braceIndex !== -1 
+          ? JSON.parse(errorString.substring(braceIndex)) 
+          : error;
+        
+        const details = errorData?.error?.details || errorData?.details;
+        if (Array.isArray(details)) {
+          const retryInfo = details.find((d: any) => d['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
+          if (retryInfo?.retryDelay) {
+            const seconds = parseFloat(retryInfo.retryDelay.replace('s', ''));
+            if (!isNaN(seconds)) retryAfterMs = seconds * 1000;
+          }
+        }
+        
+        if (retryAfterMs === 0) {
+          const match = errorString.match(/retry in (\d+\.?\d*)s/i);
+          if (match) retryAfterMs = parseFloat(match[1]) * 1000;
+        }
+      } catch (parseErr) {
+        // Fallback for non-JSON or malformed error strings
+      }
+
+      const isRateLimited = 
+        error.status === 429 || 
+        error.code === 429 || 
+        error.status === "RESOURCE_EXHAUSTED" ||
+        (error.message && (error.message.includes("Quota exceeded") || error.message.includes("RESOURCE_EXHAUSTED")));
+
+      if (isRateLimited) {
+        if (retryAfterMs > 15000) throw error; // Don't wait too long
+
+        const delay = retryAfterMs > 0 
+          ? retryAfterMs + 500 + (Math.random() * 500) 
+          : baseDelay * Math.pow(2, i) + (Math.random() * 500);
+        
+        console.warn(`Gemini API Rate Limit: Waiting ${Math.round(delay)}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
+}
+
 export const generateQuestion = async (
   scenarioId: string,
-  level: EnglishLevel
+  level: EnglishLevel,
+  excludeQuestion?: string
 ): Promise<QuestionResponse> => {
-  // Simulate async behavior for consistent API, though it's instant
   return new Promise((resolve) => {
-    const levelQuestions = LOCAL_QUESTIONS[scenarioId]?.[level];
+    let levelQuestions = LOCAL_QUESTIONS[scenarioId]?.[level] || [];
     
-    if (levelQuestions && levelQuestions.length > 0) {
+    // Filter out the current question to ensure variety
+    if (excludeQuestion && levelQuestions.length > 1) {
+      levelQuestions = levelQuestions.filter(q => q.question !== excludeQuestion);
+    }
+
+    if (levelQuestions.length > 0) {
       const randomIndex = Math.floor(Math.random() * levelQuestions.length);
       resolve(levelQuestions[randomIndex]);
     } else {
-      // Fallback if something goes wrong
       resolve({
         question: "Could you tell me about yourself?",
         contextKr: "자기소개를 부탁드립니다."
@@ -33,66 +94,41 @@ export const generateQuestion = async (
   });
 };
 
-/**
- * Generates speech audio from text using Gemini TTS.
- */
 export const generateSpeech = async (text: string): Promise<string> => {
-  try {
+  return withRetry(async () => {
     const response = await ai.models.generateContent({
       model: TTS_MODEL,
       contents: [{ parts: [{ text }] }],
       config: {
         responseModalities: [Modality.AUDIO],
         speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Kore' }, // Kore, Puck, Charon, Fenrir, Zephyr
-            },
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Kore' },
+          },
         },
       },
     });
     
     const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!audioData) throw new Error("No audio generated");
+    if (!audioData) throw new Error("TTS output was empty.");
     return audioData;
-  } catch (error: any) {
-    console.error("TTS Error", error);
-    if (error.status === 429 && error.message.includes("Quota exceeded")) {
-      throw new Error("TTS Quota Exceeded: Please try again later or contact support.");
-    }
-    throw error;
-  }
+  });
 };
 
-/**
- * Analyzes the user's audio response for a specific word or phrase pronunciation.
- */
 export const analyzePronunciation = async (
   audioBase64: string,
   targetText: string,
-  mimeType: string, // Added mimeType parameter
+  mimeType: string,
 ): Promise<PronunciationCheckResponse> => {
-  try {
+  return withRetry(async () => {
     const prompt = `
-      You are an expert English pronunciation tutor for a Korean speaker.
-      The user is attempting to pronounce the English word or phrase: "${targetText}".
-      Analyze the user's audio response and provide a JSON object with the following:
-      - transcript: verbatim user speech.
-      - pronunciationScore: A score from 1-10 evaluating the pronunciation of "${targetText}".
-      - accuracyMessage: A short phrase (e.g., "Excellent match!", "Good, but slight deviation", "Needs improvement", "Did not match target text") comparing the transcript to "${targetText}".
-      - explanationEn: A concise English explanation for any pronunciation issues, or praise if perfect.
-      - explanationKr: A concise Korean explanation for the same.
-      - pronunciationTips: (Only if pronunciationScore < 7) An array of 1-2 {word, targetPhoneme, advice, mouthPosition} focusing on critical sounds in "${targetText}".
-      - transcriptConfidence: 0.0-1.0 representing AI's confidence in its own transcription.
+      You are an expert English pronunciation tutor. Analyze the user's audio for: "${targetText}".
+      If the audio is silent or contains no English speech, return the transcript as an empty string "".
+      All scores must be an integer from 1 to 10.
+      Provide feedback in JSON format.
     `;
-
-    const audioPart = {
-      inlineData: {
-        mimeType: mimeType, // Use the passed mimeType
-        data: audioBase64
-      }
-    };
+    const audioPart = { inlineData: { mimeType, data: audioBase64 } };
     const textPart = { text: prompt };
-
     const response = await ai.models.generateContent({
       model: MODEL_NAME,
       contents: { parts: [audioPart, textPart] },
@@ -102,11 +138,13 @@ export const analyzePronunciation = async (
           type: Type.OBJECT,
           properties: {
             transcript: { type: Type.STRING },
-            pronunciationScore: { type: Type.INTEGER },
+            pronunciationScore: { 
+              type: Type.INTEGER, 
+              description: "Pronunciation score from 1 to 10" 
+            },
             accuracyMessage: { type: Type.STRING },
             explanationEn: { type: Type.STRING },
             explanationKr: { type: Type.STRING },
-            transcriptConfidence: { type: Type.NUMBER },
             pronunciationTips: {
               type: Type.ARRAY,
               items: {
@@ -125,63 +163,26 @@ export const analyzePronunciation = async (
         }
       }
     });
-
     const text = response.text;
-    if (!text) throw new Error("No response from AI for pronunciation analysis");
+    if (!text) throw new Error("Analysis response was empty.");
     return JSON.parse(text) as PronunciationCheckResponse;
-
-  } catch (error: any) {
-    console.error("Error analyzing pronunciation:", error);
-    if (error.status === 429 && error.message.includes("Quota exceeded")) {
-      throw new Error("Pronunciation Analysis Quota Exceeded: Please try again later.");
-    }
-    throw error;
-  }
+  });
 };
 
-/**
- * Analyzes the user's audio response.
- */
 export const analyzeAudioResponse = async (
   audioBase64: string,
   question: string,
   level: EnglishLevel
 ): Promise<FeedbackResponse> => {
-  try {
+  return withRetry(async () => {
     const prompt = `
-      You are an expert English tutor for a Korean speaker.
-      User's question: "${question}"
-      Target Level: ${level}
-
-      Analyze the user's audio response and provide a JSON object with the following:
-      - transcript: verbatim user speech.
-      - correction: A natural, grammatically correct and appropriate English expression that *improves upon the user's 'transcript'* as a response to the 'User's question'. Focus on correcting errors and making it sound more natural.
-      - explanationEn: concise English explanation for improvement.
-      - explanationKr: concise Korean explanation for improvement.
-      - examples: 3 alternative sentences for the question.
-      - grammarScore: 1-10.
-      - pronunciationScore: 1-10.
-      - fluencyScore: 1-10.
-      - speakingRateWPM: estimated words per minute.
-      - transcriptConfidence: 0.0-1.0.
-      - pronunciationTips: (if pronunciationScore < 7) array of {word, targetPhoneme, advice, mouthPosition}.
+      Analyze the response for Question: "${question}" at Level: ${level}.
+      CRITICAL INSTRUCTION: If the audio is silent, contains only background noise, or no recognizable speech is detected, YOU MUST return "transcript": "" (an empty string).
+      SCORING INSTRUCTION: Use a scale of 1 to 10 (where 10 is perfect) for grammarScore, pronunciationScore, and fluencyScore. 
+      Otherwise, provide JSON feedback including transcript, correction, scores, and explanations.
     `;
-
-    const audioPart = {
-      inlineData: {
-        mimeType: 'audio/wav', // Assuming wav/webm from browser recording
-        data: audioBase64
-      }
-    };
+    const audioPart = { inlineData: { mimeType: 'audio/webm', data: audioBase64 } };
     const textPart = { text: prompt };
-
-    // Calculate prompt tokens
-    const promptTokenCountResponse = await ai.models.countTokens({
-      model: MODEL_NAME,
-      contents: { parts: [audioPart, textPart] }
-    });
-    const promptTokens = promptTokenCountResponse.totalTokens;
-
     const response = await ai.models.generateContent({
       model: MODEL_NAME,
       contents: { parts: [audioPart, textPart] },
@@ -194,64 +195,27 @@ export const analyzeAudioResponse = async (
             correction: { type: Type.STRING },
             explanationEn: { type: Type.STRING },
             explanationKr: { type: Type.STRING },
-            examples: { 
-              type: Type.ARRAY,
-              items: { type: Type.STRING }
+            examples: { type: Type.ARRAY, items: { type: Type.STRING } },
+            grammarScore: { 
+              type: Type.INTEGER, 
+              description: "Grammar score from 1 to 10" 
             },
-            grammarScore: { type: Type.INTEGER },
-            pronunciationScore: { type: Type.INTEGER },
-            fluencyScore: { type: Type.INTEGER },
-            speakingRateWPM: { type: Type.INTEGER }, // Added speaking rate
-            transcriptConfidence: { type: Type.NUMBER }, 
-            pronunciationTips: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  word: { type: Type.STRING },
-                  targetPhoneme: { type: Type.STRING },
-                  advice: { type: Type.STRING },
-                  mouthPosition: { type: Type.STRING, enum: ["rounded", "wide", "tongue_up", "relaxed"] }
-                },
-                required: ['word', 'targetPhoneme', 'advice', 'mouthPosition']
-              }
-            }
+            pronunciationScore: { 
+              type: Type.INTEGER, 
+              description: "Pronunciation score from 1 to 10" 
+            },
+            fluencyScore: { 
+              type: Type.INTEGER, 
+              description: "Fluency score from 1 to 10" 
+            },
+            speakingRateWPM: { type: Type.INTEGER }
           },
-          required: ['transcript', 'correction', 'explanationEn', 'explanationKr', 'examples', 'grammarScore', 'pronunciationScore', 'fluencyScore', 'speakingRateWPM', 'transcriptConfidence']
+          required: ['transcript', 'correction', 'explanationEn', 'explanationKr', 'examples', 'grammarScore', 'pronunciationScore', 'fluencyScore', 'speakingRateWPM']
         }
       }
     });
-
     const text = response.text;
-    if (!text) throw new Error("No response from AI");
-
-    // Calculate response tokens
-    const responseTokenCountResponse = await ai.models.countTokens({
-      model: MODEL_NAME,
-      contents: { parts: [{ text: text }] }
-    });
-    const responseTokens = responseTokenCountResponse.totalTokens;
-
-    const parsedResult = JSON.parse(text) as FeedbackResponse;
-
-    // Calculate user answer tokens (based on AI's transcript)
-    const userAnswerTokenCountResponse = await ai.models.countTokens({
-      model: MODEL_NAME,
-      contents: { parts: [{ text: parsedResult.transcript }] }
-    });
-    const userAnswerTokens = userAnswerTokenCountResponse.totalTokens;
-
-    return {
-      ...parsedResult,
-      promptTokens,
-      userAnswerTokens,
-      responseTokens,
-    };
-  } catch (error: any) {
-    console.error("Error analyzing audio:", error);
-    if (error.status === 429 && error.message.includes("Quota exceeded")) {
-      throw new Error("Analysis Quota Exceeded: Please try again later or contact support.");
-    }
-    throw error;
-  }
+    if (!text) throw new Error("Analysis response was empty.");
+    return JSON.parse(text) as FeedbackResponse;
+  });
 };

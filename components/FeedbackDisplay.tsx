@@ -1,29 +1,46 @@
+
 import React, { useState, useRef, useEffect } from 'react';
-import { FeedbackResponse, PronunciationTip } from '../types'; // Import PronunciationTip for local usage
+import { FeedbackResponse, HistoryEntry, EnglishLevel } from '../types';
 import { generateSpeech } from '../services/geminiService';
-import { decode, decodeAudioData, appendExplanationToLocalStorage } from '../utils'; // Import appendExplanationToLocalStorage
-import { CheckCircle2, MessageCircle, Lightbulb, Repeat, Languages, BarChart2, Volume2, AlertTriangle, Info, Eye, EyeOff } from 'lucide-react';
+import { decode, decodeAudioData, saveToHistory } from '../utils';
+import { CheckCircle2, BarChart2, Lightbulb, Repeat, Languages, Volume2, AlertTriangle, Eye, EyeOff } from 'lucide-react';
 import { Spinner } from './Spinner';
+import { format } from 'date-fns';
 
 interface FeedbackDisplayProps {
   feedback: FeedbackResponse;
+  question: string;
+  level: EnglishLevel;
   onNext: () => void;
 }
 
-// ScoreBar and MouthShapeIcon are moved to App.tsx or a shared component
-
-const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) => {
+const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, question, level, onNext }) => {
   const [playingIndex, setPlayingIndex] = useState<number | null>(null);
-  const [playingExplanation, setPlayingExplanation] = useState<'en' | 'kr' | null>(null); // New state for explanation audio
-  const [showExplanations, setShowExplanations] = useState(true); // New state for explanations
+  const [playingExplanation, setPlayingExplanation] = useState<'en' | 'kr' | null>(null);
+  const [showExplanations, setShowExplanations] = useState(true);
   const audioContextRef = useRef<AudioContext | null>(null);
 
   useEffect(() => {
-    // Save English explanation to local storage when feedback is available
-    if (feedback?.explanationEn) {
-      appendExplanationToLocalStorage(feedback.explanationEn);
+    if (feedback && feedback.transcript) {
+      const historyEntry: HistoryEntry = {
+        timestamp: format(new Date(), 'yyyy-MM-dd HH:mm:ss'),
+        question: question,
+        level: level,
+        transcript: feedback.transcript,
+        correction: feedback.correction,
+        explanationEn: feedback.explanationEn,
+        explanationKr: feedback.explanationKr,
+        scores: {
+          grammar: feedback.grammarScore,
+          pronunciation: feedback.pronunciationScore,
+          fluency: feedback.fluencyScore,
+          speakingRateWPM: feedback.speakingRateWPM
+        },
+        examples: feedback.examples
+      };
+      saveToHistory(historyEntry);
     }
-  }, [feedback?.explanationEn]); // Dependency on explanationEn ensures it runs only when explanationEn changes
+  }, [feedback, question, level]);
 
   const getAudioContext = async () => {
     if (!audioContextRef.current) {
@@ -35,25 +52,10 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
     return audioContextRef.current;
   };
 
-  const stopCurrentAudio = () => {
-    // This example focuses on stopping AudioBufferSourceNodes explicitly created and managed.
-    // A more robust solution might manage all playing sources.
-    // For now, this assumes only one type of audio (example or explanation) plays at a time.
-    if (audioContextRef.current) {
-      audioContextRef.current.suspend(); // Pause all audio
-      // In a real app, you might iterate and stop specific sources if multiple were playing.
-    }
-  };
-
   const handlePlayAudio = async (text: string, type: 'example' | 'explanationEn' | 'explanationKr', index: number | null = null) => {
-    // Prevent multiple audios playing simultaneously
     if (playingIndex !== null || playingExplanation !== null) {
-      stopCurrentAudio(); // Stop any currently playing audio before starting new one
       setPlayingIndex(null);
       setPlayingExplanation(null);
-      if (type === 'example' && playingIndex === index) return; // If clicked same example again
-      if (type === 'explanationEn' && playingExplanation === 'en') return;
-      if (type === 'explanationKr' && playingExplanation === 'kr') return;
     }
 
     if (type === 'example') {
@@ -64,7 +66,7 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
 
     try {
       const base64 = await generateSpeech(text);
-      const ctx = await getAudioContext(); // Ensure context is resumed
+      const ctx = await getAudioContext();
 
       if (ctx) {
         const audioBuffer = await decodeAudioData(decode(base64), ctx, 24000, 1);
@@ -73,40 +75,35 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
         source.connect(ctx.destination);
         
         source.onended = () => {
-          if (type === 'example') {
-            setPlayingIndex(null);
-          } else {
-            setPlayingExplanation(null);
-          }
-          ctx.suspend(); // Suspend context after playback to free resources
+          if (type === 'example') setPlayingIndex(null);
+          else setPlayingExplanation(null);
         };
         source.start();
       }
     } catch (e) {
       console.error("Error playing audio:", e);
-      if (type === 'example') {
-        setPlayingIndex(null);
-      } else {
-        setPlayingExplanation(null);
-      }
+      setPlayingIndex(null);
+      setPlayingExplanation(null);
     }
   };
 
-  // Helper component definitions (ScoreBar, MouthShapeIcon) are removed from here
-  // and will be defined in App.tsx or a shared file if used elsewhere.
   const ScoreBar: React.FC<{ label: string; score: number; colorClass: string; displayValue?: string }> = ({ label, score, colorClass, displayValue }) => {
-    // Clamp score for visual bar to be between 0 and 10 for width calculation
-    const clampedScore = Math.max(0, Math.min(10, score));
+    // Ensure score is clamped for the bar visualization, but use original for label if valid
+    const clampedScoreForBar = Math.max(0, Math.min(10, score));
+    const labelScore = Math.max(1, Math.min(10, Math.round(score)));
+    
     return (
       <div className="flex items-center gap-4">
         <span className="w-28 text-sm font-semibold text-slate-600">{label}</span>
         <div className="flex-grow h-3 bg-slate-200 rounded-full overflow-hidden">
           <div 
             className={`h-full rounded-full transition-all duration-1000 ease-out ${colorClass}`} 
-            style={{ width: `${clampedScore * 10}%` }}
+            style={{ width: `${clampedScoreForBar * 10}%` }}
           ></div>
         </div>
-        <span className="w-fit text-right text-sm font-bold text-slate-700">{displayValue || `${score}/10`}</span>
+        <span className="w-12 text-right text-sm font-bold text-slate-700">
+          {displayValue || `${labelScore}/10`}
+        </span>
       </div>
     );
   };
@@ -147,7 +144,6 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
 
   return (
     <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden animate-fade-in">
-      {/* Header */}
       <div className="bg-slate-50 px-6 py-4 border-b border-slate-200 flex justify-between items-center">
         <h3 className="font-bold text-slate-700 flex items-center gap-2">
           <CheckCircle2 className="text-secondary" size={20} />
@@ -157,8 +153,6 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
       </div>
 
       <div className="p-6 space-y-6">
-        
-        {/* Scores Section */}
         <div className="bg-slate-50 rounded-xl p-5 border border-slate-200/60">
            <h4 className="text-xs font-bold text-slate-500 uppercase mb-4 flex items-center gap-2 tracking-wide">
              <BarChart2 size={16} /> Performance Scores
@@ -166,14 +160,14 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
            <div className="space-y-3">
              <ScoreBar label="Grammar" score={feedback.grammarScore} colorClass="bg-blue-500" />
              <ScoreBar label="Pronunciation" score={feedback.pronunciationScore} colorClass="bg-indigo-500" />
-             {/* Fluency and Speaking Rate side-by-side */}
              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <ScoreBar label="Fluency" score={feedback.fluencyScore} colorClass="bg-emerald-500" />
                 {feedback.speakingRateWPM !== undefined && (
                     <ScoreBar 
-                      label="Speaking Rate" 
-                      score={Math.min(10, Math.max(1, Math.round((feedback.speakingRateWPM || 0) / 20)))} // Scale WPM to 1-10 for bar
-                      displayValue={`${feedback.speakingRateWPM} WPM`} // Display actual WPM
+                      label="Speed" 
+                      // 150 WPM is roughly a perfect 10 for advanced learners. 15 WPM per score point.
+                      score={Math.min(10, Math.max(1, Math.round((feedback.speakingRateWPM || 0) / 15)))}
+                      displayValue={`${feedback.speakingRateWPM} WPM`}
                       colorClass="bg-purple-500" 
                     /> 
                 )}
@@ -181,7 +175,6 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
            </div>
         </div>
 
-        {/* Pronunciation Deep Dive (Conditional) */}
         {feedback.pronunciationScore < 7 && feedback.pronunciationTips && feedback.pronunciationTips.length > 0 && (
           <div className="bg-orange-50 rounded-xl p-5 border border-orange-100">
              <div className="flex items-center gap-2 mb-4 text-orange-700">
@@ -212,7 +205,6 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
           </div>
         )}
 
-        {/* Transcript & Correction Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           <div className="space-y-2">
             <label className="text-xs font-bold text-slate-400 uppercase tracking-wide">You Said</label>
@@ -224,12 +216,11 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
           <div className="space-y-2">
             <label className="text-xs font-bold text-emerald-600 uppercase tracking-wide">Better Way</label>
             <div className="p-4 bg-emerald-50 rounded-xl border border-emerald-100 text-slate-800 font-medium">
-              "<span>{feedback.correction}</span>"
+              "{feedback.correction}"
             </div>
           </div>
         </div>
 
-        {/* Explanations Toggle Button */}
         <div className="flex justify-start">
           <button
             onClick={() => setShowExplanations(!showExplanations)}
@@ -240,11 +231,8 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
           </button>
         </div>
 
-
-        {/* Explanations */}
         {showExplanations && (
           <div className="space-y-4">
-            {/* English Explanation */}
             <div className="bg-indigo-50 rounded-xl p-5 border border-indigo-100">
               <div className="flex items-start gap-3 mb-3">
                 <Lightbulb className="text-indigo-600 shrink-0 mt-1" size={20} />
@@ -256,21 +244,13 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
                     ml-auto flex-shrink-0 p-2 rounded-full transition-colors
                     ${playingExplanation === 'en' ? 'bg-indigo-200 text-indigo-700' : 'text-slate-400 hover:bg-white hover:text-indigo-600 hover:shadow-sm'}
                   `}
-                  title="Listen to English explanation"
                 >
-                  {playingExplanation === 'en' ? (
-                    <Spinner className="w-4 h-4" />
-                  ) : (
-                    <Volume2 size={18} />
-                  )}
+                  {playingExplanation === 'en' ? <Spinner className="w-4 h-4" /> : <Volume2 size={18} />}
                 </button>
               </div>
-              <p className="text-slate-700 text-sm leading-relaxed">
-                <span>{feedback.explanationEn}</span>
-              </p>
+              <p className="text-slate-700 text-sm leading-relaxed">{feedback.explanationEn}</p>
             </div>
 
-            {/* Korean Explanation */}
             <div className="bg-blue-50 rounded-xl p-5 border border-blue-100">
               <div className="flex items-start gap-3 mb-3">
                 <Languages className="text-primary shrink-0 mt-1" size={20} />
@@ -282,29 +262,17 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
                     ml-auto flex-shrink-0 p-2 rounded-full transition-colors
                     ${playingExplanation === 'kr' ? 'bg-blue-200 text-blue-700' : 'text-slate-400 hover:bg-white hover:text-primary hover:shadow-sm'}
                   `}
-                  title="한국어 설명을 듣기"
                 >
-                  {playingExplanation === 'kr' ? (
-                    <Spinner className="w-4 h-4" />
-                  ) : (
-                    <Volume2 size={18} />
-                  )}
+                  {playingExplanation === 'kr' ? <Spinner className="w-4 h-4" /> : <Volume2 size={18} />}
                 </button>
               </div>
-              <p className="text-slate-700 font-kr text-sm leading-relaxed">
-                <span>{feedback.explanationKr}</span>
-              </p>
+              <p className="text-slate-700 font-kr text-sm leading-relaxed">{feedback.explanationKr}</p>
             </div>
           </div>
         )}
 
-        {/* Examples */}
         <div className="space-y-3">
-          <label className="text-xs font-bold text-slate-400 uppercase tracking-wide flex items-center gap-2">
-            <Repeat size={14} /> Usage Examples
-          </label>
           <ul className="space-y-2">
-            {/* Limit to first 2 examples */}
             {feedback.examples.slice(0, 2).map((ex, i) => (
               <li key={i} className="flex items-center justify-between gap-3 text-slate-600 bg-slate-50 px-4 py-3 rounded-lg border border-slate-100">
                 <div className="flex items-center gap-3 flex-grow">
@@ -320,48 +288,20 @@ const FeedbackDisplay: React.FC<FeedbackDisplayProps> = ({ feedback, onNext }) =
                     flex-shrink-0 p-2 rounded-full transition-colors
                     ${playingIndex === i ? 'bg-indigo-100 text-indigo-600' : 'text-slate-400 hover:bg-white hover:text-primary hover:shadow-sm'}
                   `}
-                  title="Listen to example"
                 >
-                  {playingIndex === i ? (
-                    <Spinner className="w-4 h-4" />
-                  ) : (
-                    <Volume2 size={18} />
-                  )}
+                  {playingIndex === i ? <Spinner className="w-4 h-4" /> : <Volume2 size={18} />}
                 </button>
               </li>
             ))}
           </ul>
         </div>
 
-        {/* Technical Details */}
-        {(feedback.transcriptConfidence !== undefined || feedback.promptTokens !== undefined || feedback.userAnswerTokens !== undefined || feedback.responseTokens !== undefined) && (
-          <div className="bg-slate-50 rounded-xl p-5 border border-slate-200/60 text-sm text-slate-600">
-             <h4 className="text-xs font-bold text-slate-500 uppercase mb-3 flex items-center gap-2 tracking-wide">
-               <Info size={16} /> Technical Details
-             </h4>
-             <ul className="space-y-1">
-               {feedback.transcriptConfidence !== undefined && (
-                 <li><span className="font-semibold">Transcript Confidence:</span> {(feedback.transcriptConfidence * 100).toFixed(0)}%</li>
-               )}
-               {feedback.promptTokens !== undefined && (
-                 <li><span className="font-semibold">Prompt Tokens:</span> {feedback.promptTokens}</li>
-               )}
-               {feedback.userAnswerTokens !== undefined && (
-                 <li><span className="font-semibold">User Answer Tokens (AI's transcript):</span> {feedback.userAnswerTokens}</li>
-               )}
-               {feedback.responseTokens !== undefined && (
-                 <li><span className="font-semibold">Response Tokens:</span> {feedback.responseTokens}</li>
-               )}
-             </ul>
-          </div>
-        )}
-
         <div className="pt-4 flex justify-end">
           <button
             onClick={onNext}
             className="bg-primary hover:bg-blue-600 text-white px-8 py-3 rounded-full font-semibold shadow-md hover:shadow-lg transition-all transform hover:-translate-y-0.5 flex items-center gap-2"
           >
-            Next Scenario <Repeat size={18} />
+            Next Practice <Repeat size={18} />
           </button>
         </div>
       </div>
